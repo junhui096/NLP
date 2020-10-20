@@ -1,9 +1,9 @@
 # python3.5 buildtagger.py <train_file_absolute_path> <model_file_absolute_path>
 
-import os
-import math
+# import os
+# import math
 import sys
-from typing import Any
+# from typing import Any
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from collections import Counter
 import random
+
 
 word_freq = Counter()
 word_ix = {}
@@ -66,36 +67,40 @@ CHAR_SIZE = 128  # Ascii
 MAX_SENTENCE_LEN = 150
 MAX_WORD_LEN = 45
 CHAR_EMBEDDING_DIM = 256
-WORD_EMBEDDING_DIM = 300
-HIDDEN_DIM = 0
-NUM_OF_FILTERS = 0
+WORD_EMBEDDING_DIM = 128
+HIDDEN_DIM = 128
+NUM_OF_FILTERS = 7
 PADDING = 1
 TAGSET_SIZE = 45
 WINDOW_SIZE = 3
-LSTM_LAYERS = 1
-DROPOUT_PROB = 0
+LSTM_LAYERS = 3
+DROPOUT_PROB = 0.5
 BATCH_SIZE = 128
 NUM_EPOCHS = 30
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 class CNNBiLSTMTagger(nn.Module):
 
     def __init__(self, vocab_size, tagset_size, char_embedding_dim, word_embedding_dim, hidden_dim, dropout,
-                 num_of_filters, window_size, padding, num_layers):
+                 num_of_filters, window_size, padding, num_layers, conv_dropout_prob=0.2):
         super(CNNBiLSTMTagger, self).__init__()
         self.hidden_dim = hidden_dim
         self.char_embeddings = nn.Embedding(CHAR_SIZE, char_embedding_dim, padding_idx=0)
         # padding = 1 to preserve input shape. (#batch, #chars, #char_features)
-        self.conv1 = nn.Sequential(nn.Conv1d(in_channels=CHAR_SIZE, out_channels=num_of_filters,
+        self.conv1 = nn.Sequential(nn.Conv1d(in_channels=CHAR_EMBEDDING_DIM, out_channels=num_of_filters,
                                              kernel_size=window_size, padding=padding), nn.Sigmoid(),
-                                   nn.MaxPool1d(MAX_WORD_LEN))
+                                   nn.MaxPool1d(MAX_WORD_LEN), nn.Dropout(conv_dropout_prob))
         self.word_embeddings = nn.Embedding(vocab_size + 2, word_embedding_dim, padding_idx=vocab_size + 1)
         # The LSTM takes word embeddings as inputs, and outputs hidden states
         # with dimensionality hidden_dim.
         self.biLSTM = nn.LSTM(num_of_filters + word_embedding_dim, hidden_dim, num_layers=num_layers, bias=True,
                               batch_first=True, dropout=dropout, bidirectional=True)
         # The linear layer that maps from hidden state space to tag space
-        self.hidden2tag = nn.Linear(2*hidden_dim, tagset_size)
+        self.hidden2tag = nn.Linear(2 * hidden_dim, tagset_size)
+
+        self.fc_dropout = nn.Dropout(dropout)
 
     def forward(self, sentence):
         # Add your code here for character CNN and BiLSTM
@@ -105,11 +110,11 @@ class CNNBiLSTMTagger(nn.Module):
         char_embed = self.char_embeddings(char_tensor)
         char_embed = torch.transpose(char_embed, 1, 2)
         char_conv_output = self.conv1(char_embed)
-        #Shape (#batches, #filters + #word features, # words)
-        lstm_input = torch.cat([word_embed, char_conv_output])
+        # Shape (#batches, #filters + #word features, # words)
+        lstm_input = torch.cat([word_embed, char_conv_output], dim=1)
         lstm_input = torch.transpose(lstm_input, 1, 2)
         lstm_output, _ = self.biLSTM(lstm_input)
-        tag_space = self.hidden2tag(lstm_output)
+        tag_space = self.fc_dropout(self.hidden2tag(lstm_output))
         tag_scores = F.log_softmax(tag_space, dim=2)
         return tag_scores
 
@@ -148,7 +153,7 @@ def encode_sent_as_char_tensor(sentence):
             res_tensor[starting_index + j] = get_char_embedding_ix(char)
             j += 1
         starting_index += MAX_WORD_LEN
-    return torch.tensor(res_tensor, dtype=torch.long)
+    return torch.tensor(res_tensor, dtype=torch.long, device=device)
 
 
 def encode_input_vector_as_tensors(training_words):
@@ -163,14 +168,14 @@ def encode_input_vector_as_tensors(training_words):
                     last_count += 1
                     word_ix[word] = last_count
                 input_tensor[index] = word_ix[word]
-        tensors.append((torch.tensor(input_tensor, dtype=torch.long), encode_sent_as_char_tensor(sentence)))
+        tensors.append((torch.tensor(input_tensor, dtype=torch.long, device=device), encode_sent_as_char_tensor(sentence)))
     return tensors, last_count
 
 
 def pad_input_vectors(input_vectors, vocab_size):
     for index, (word_vector, char_vector) in enumerate(input_vectors):
         pad_len = MAX_SENTENCE_LEN - word_vector.shape[0]
-        input_vectors[index] = (F.pad(word_vector, [0, pad_len], vocab_size + 1), char_vector)
+        input_vectors[index] = (F.pad(word_vector, [0, pad_len], value=vocab_size + 1), char_vector)
     return input_vectors
 
 
@@ -182,35 +187,39 @@ def pad_output_vectors(output_vectors):
 
 
 def encode_output_tags_as_tensor(tags):
-    return [torch.tensor([tag_to_idx[t] for t in tag_list], dtype=torch.long) for tag_list in tags]
+    return [torch.tensor([tag_to_idx[t] for t in tag_list], dtype=torch.long, device=device) for tag_list in tags]
 
 
 def batch_input(input_vectors, output_vectors):
     num_samples = len(input_vectors)
+    stacked_word_vectors = torch.stack([v[0] for v in input_vectors])
+    stacked_char_vectors = torch.stack([v[1] for v in input_vectors])
+    stacked_output_vectors = torch.stack(output_vectors)
     permutation = torch.randperm(num_samples)
     for i in range(0, num_samples, BATCH_SIZE):
-        indices = permutation[i : i + BATCH_SIZE]
-        yield [input_vectors[x] for x in indices], [output_vectors[y] for y in indices]
+        indices = permutation[i: i + BATCH_SIZE]
+        yield stacked_word_vectors[indices], stacked_char_vectors[indices], stacked_output_vectors[indices]
 
 
 def train_model(train_file, model_file):
     init_random_seeds()
     with open(train_file, "r") as f:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         lines = f.readlines()
         input = [process_line(line) for line in lines]
         # vocab_size exclude unk token.
         input_vectors, vocab_size = encode_input_vector_as_tensors([t[0] for t in input])
         input_vectors = pad_input_vectors(input_vectors, vocab_size)
-        output_vectors = encode_output_tags_as_tensor([t[1] for t in input])
+        output_vectors = pad_output_vectors(encode_output_tags_as_tensor([t[1] for t in input]))
 
         model = CNNBiLSTMTagger(vocab_size, TAGSET_SIZE, CHAR_EMBEDDING_DIM, WORD_EMBEDDING_DIM, HIDDEN_DIM,
                                 DROPOUT_PROB, NUM_OF_FILTERS, WINDOW_SIZE, PADDING, LSTM_LAYERS)
+        model.to(device=device)
         loss_function = nn.NLLLoss()
         optimizer = optim.SGD(model.parameters(), lr=0.1)
 
         for epoch in range(NUM_EPOCHS):
-            for batch_x, batch_y in batch_input(input_vectors, output_vectors):
+            for word_vectors, char_vectors, batch_y in batch_input(input_vectors, output_vectors):
+                batch_x = (word_vectors, char_vectors)
                 # Step 1. Remember that Pytorch accumulates gradients.
                 # We need to clear them out before each instance
                 model.zero_grad()
@@ -221,12 +230,12 @@ def train_model(train_file, model_file):
                 #  calling optimizer.step()
                 batch_size, num_words, num_classes = tag_scores.shape
                 loss = loss_function(tag_scores.reshape(batch_size * num_words, num_classes),
-                              batch_y.reshape(BATCH_SIZE * num_words))
+                                     batch_y.reshape(batch_size * num_words))
                 loss.backward()
                 optimizer.step()
+            print("Completed epoch {}".format(epoch))
 
     torch.save((word_ix, model.state_dict()), model_file)
-        # input_vectors
 
     # write your code here. You can add functions as well.
     # use torch library to save model parameters, hyperparameters, etc. to model_file
