@@ -4,7 +4,7 @@
 # import math
 import sys
 # from typing import Any
-
+import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -114,7 +114,7 @@ class CNNBiLSTMTagger(nn.Module):
         lstm_input = torch.cat([word_embed, char_conv_output], dim=1)
         lstm_input = torch.transpose(lstm_input, 1, 2)
         lstm_output, _ = self.biLSTM(lstm_input)
-        tag_space = self.fc_dropout(self.hidden2tag(lstm_output))
+        tag_space = self.hidden2tag(lstm_output)
         tag_scores = F.log_softmax(tag_space, dim=2)
         return tag_scores
 
@@ -218,6 +218,8 @@ def train_model(train_file, model_file):
         optimizer = optim.SGD(model.parameters(), lr=0.1)
 
         for epoch in range(NUM_EPOCHS):
+            average_loss = 0
+            count = 0
             for word_vectors, char_vectors, batch_y in batch_input(input_vectors, output_vectors):
                 batch_x = (word_vectors, char_vectors)
                 # Step 1. Remember that Pytorch accumulates gradients.
@@ -233,7 +235,9 @@ def train_model(train_file, model_file):
                                      batch_y.reshape(batch_size * num_words))
                 loss.backward()
                 optimizer.step()
-            print("Completed epoch {}".format(epoch))
+                average_loss += loss.item()
+                count += 1
+            print("Completed epoch {} with loss {}".format(epoch, str(average_loss/count)))
 
     torch.save((word_ix, model.state_dict()), model_file)
 
@@ -246,4 +250,7 @@ if __name__ == "__main__":
     # make no changes here
     train_file = sys.argv[1]
     model_file = sys.argv[2]
+    start_time = datetime.datetime.now()
     train_model(train_file, model_file)
+    end_time = datetime.datetime.now()
+    print('Time:', end_time - start_time)
